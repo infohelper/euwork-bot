@@ -8,7 +8,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TG = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 OPENAI_URL = "https://api.openai.com/v1/responses"
 
-app = Flask(__name__)
+application = Flask(__name__)
+app = application
+
 
 SYSTEM = """
 Ты автоответчик Telegram для проекта "Работа в Европе".

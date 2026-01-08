@@ -1,181 +1,223 @@
 import os
-import time
-import json
-import threading
+import re
 import requests
 from flask import Flask, request
 
-# ==== ENV ====
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")  # можно не трогать
+# -------------------------
+# ENV (Render Environment Variables)
+# -------------------------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var")
+if not OPENAI_API_KEY:
+    raise RuntimeError("Missing OPENAI_API_KEY env var")
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 OPENAI_URL = "https://api.openai.com/v1/responses"
 
 app = Flask(__name__)
 
-# Память в RAM (для Free Render нормально)
-user_state = {}          # chat_id -> {"stage": 0/1/2/3, "age":.., "country":.., "citizenship":..}
-processed_updates = set()  # update_id to dedupe
-processed_lock = threading.Lock()
+# Простая память (в RAM). После перезапуска Render память обнуляется — это нормально для старта.
+user_state = {}  # chat_id -> {"age":..., "country":..., "citizenship":..., "ready": bool}
 
-SYSTEM_PROMPT = (
-    "Ты автоответчик Telegram для проекта 'Работа в Европе'. "
-    "Отвечай как живой менеджер: коротко, уверенно, дружелюбно. "
-    "Сначала собери 3 пункта: возраст, страна где сейчас, гражданство. "
-    "После этого задай 2-3 уточняющих вопроса (опыт/язык/какая страна интересует) и предложи следующий шаг."
-)
 
+# -------------------------
+# Helpers
+# -------------------------
 def tg_send(chat_id: int, text: str):
-    try:
-        requests.post(
-            f"{TG_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
-            timeout=10
-        )
-    except Exception:
-        pass
+    requests.post(
+        f"{TG_API}/sendMessage",
+        json={"chat_id": chat_id, "text": text},
+        timeout=20,
+    )
 
-def ask_openai(user_text: str, context: dict) -> str:
-    if not OPENAI_API_KEY:
-        return "Есть тех.сбой на стороне сервиса. Напиши, пожалуйста: возраст, страна, гражданство — и я продолжу."
 
-    profile = f"Профиль: возраст={context.get('age')}, страна={context.get('country')}, гражданство={context.get('citizenship')}."
-    payload = {
-        "model": MODEL,
-        "input": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"{profile}\nСообщение пользователя: {user_text}"}
-        ],
-        "temperature": 0.6
-    }
+def normalize_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def extract_profile(text: str):
+    """
+    Очень простой парсер: пытается достать возраст/страну/гражданство из одной строки.
+    Примеры:
+      "25 таджикистан таджикистан"
+      "Возраст 25, страна Польша, гражданство Узбекистан"
+    """
+    t = normalize_text(text).lower()
+
+    # возраст
+    age = None
+    m = re.search(r"\b(\d{2})\b", t)
+    if m:
+        try:
+            age_val = int(m.group(1))
+            if 16 <= age_val <= 65:
+                age = age_val
+        except:
+            pass
+
+    # страна/гражданство (берём слова после возраста или по ключевым словам)
+    country = None
+    citizenship = None
+
+    # Если есть "страна" / "гражданство"
+    m_country = re.search(r"страна[:\s\-]*([a-zа-яё\- ]{2,30})", t, re.IGNORECASE)
+    if m_country:
+        country = normalize_text(m_country.group(1)).split(" ")[0].capitalize()
+
+    m_cit = re.search(r"гражд[:\s\-]*([a-zа-яё\- ]{2,30})", t, re.IGNORECASE)
+    if m_cit:
+        citizenship = normalize_text(m_cit.group(1)).split(" ")[0].capitalize()
+
+    # Если нет ключевых слов — пробуем формат "25 страна гражданство"
+    if age is not None and (country is None or citizenship is None):
+        parts = normalize_text(text).split()
+        # найдём позицию возраста
+        idx = None
+        for i, p in enumerate(parts):
+            if p.isdigit() and int(p) == age:
+                idx = i
+                break
+        if idx is not None:
+            after = parts[idx + 1 :]
+            if len(after) >= 1 and country is None:
+                country = after[0].capitalize()
+            if len(after) >= 2 and citizenship is None:
+                citizenship = after[1].capitalize()
+
+    return age, country, citizenship
+
+
+def openai_reply(chat_id: int, user_message: str, profile: dict):
+    """
+    Запрос в OpenAI Responses API.
+    """
+    system = f"""
+Ты — менеджер по трудоустройству в Германии (проект "Работа в Европе").
+Твоя задача — быстро провести первичный скрининг и вести человека к оформлению.
+
+Тон: коротко, уверенно, дружелюбно. Без воды.
+Язык: русский.
+
+Если данных ещё нет (возраст/страна/гражданство) — сначала собери их.
+Когда собрал — уточни:
+1) есть ли загранпаспорт
+2) есть ли опыт работы и кем
+3) есть ли права категории B
+4) когда готов выехать
+
+После этого предложи 2–3 направления вакансий в Германии (склад/завод/стройка/логистика) и следующий шаг.
+
+Профиль кандидата (может быть пустым):
+Возраст: {profile.get("age")}
+Страна где сейчас: {profile.get("country")}
+Гражданство: {profile.get("citizenship")}
+"""
 
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
-    r = requests.post(OPENAI_URL, headers=headers, json=payload, timeout=30)
-    if r.status_code != 200:
-        return "Есть тех.сбой на стороне сервиса. Напиши, пожалуйста: возраст, страна, гражданство — и я продолжу."
+    payload = {
+        "model": "gpt-4.1-mini",
+        "input": [
+            {"role": "system", "content": system.strip()},
+            {"role": "user", "content": user_message},
+        ],
+        "temperature": 0.4,
+        "max_output_tokens": 400,
+    }
 
+    r = requests.post(OPENAI_URL, headers=headers, json=payload, timeout=40)
+    r.raise_for_status()
     data = r.json()
 
-    # responses API: вытаскиваем весь текст из output
-    out = []
-    for item in data.get("output", []):
-        for c in item.get("content", []):
-            if c.get("type") == "output_text":
-                out.append(c.get("text", ""))
-    answer = "\n".join([x for x in out if x]).strip()
-
-    return answer or "Ок, понял. Напиши, пожалуйста: возраст, страна, гражданство — и я продолжу."
-
-def parse_profile(text: str):
-    """
-    Очень простой парсер: ожидаем что пользователь напишет примерно:
-    '25 Таджикистан Таджикистан' или '25, Польша, Узбекистан'
-    """
-    t = text.replace(",", " ").replace(";", " ").replace("|", " ")
-    parts = [p for p in t.split() if p.strip()]
-    if len(parts) >= 3 and parts[0].isdigit():
-        age = parts[0]
-        country = parts[1]
-        citizenship = parts[2]
-        return age, country, citizenship
-    return None
-
-def handle_message(chat_id: int, text: str):
-    st = user_state.get(chat_id, {"stage": 0})
-
-    low = (text or "").strip().lower()
-
-    if low in ("/start", "start"):
-        user_state[chat_id] = {"stage": 0}
-        tg_send(chat_id, "Привет! 👋 Чтобы подобрать работу, напиши в одном сообщении:\nВозраст + страна где ты сейчас + гражданство.\nНапример: 25 Польша Узбекистан")
-        return
-
-    # Если юзер сразу прислал 3 поля одной строкой
-    parsed = parse_profile(text)
-    if parsed:
-        age, country, citizenship = parsed
-        st = {"stage": 3, "age": age, "country": country, "citizenship": citizenship}
-        user_state[chat_id] = st
-
-        reply = ask_openai("Пользователь прислал данные. Продолжи диалог и задай уточняющие вопросы.", st)
-        tg_send(chat_id, reply)
-        return
-
-    # Пошаговый сбор
-    if st.get("stage", 0) == 0:
-        user_state[chat_id] = {"stage": 1}
-        tg_send(chat_id, "Привет! 👋 Скажи, пожалуйста, сколько тебе лет?")
-        return
-
-    if st.get("stage") == 1:
-        user_state[chat_id] = {"stage": 2, "age": text.strip()}
-        tg_send(chat_id, "Отлично. В какой стране ты сейчас находишься?")
-        return
-
-    if st.get("stage") == 2:
-        st["stage"] = 3
-        st["country"] = text.strip()
-        user_state[chat_id] = st
-        tg_send(chat_id, "Понял. Какое у тебя гражданство?")
-        return
-
-    if st.get("stage") == 3 and "citizenship" not in st:
-        st["citizenship"] = text.strip()
-        user_state[chat_id] = st
-        reply = ask_openai("Данные собраны. Продолжи диалог.", st)
-        tg_send(chat_id, reply)
-        return
-
-    # Уже собрали профиль -> отвечаем через OpenAI
-    reply = ask_openai(text, st)
-    tg_send(chat_id, reply)
-
-def process_update(update: dict):
+    # В responses API текст обычно лежит в output->content
+    # Делаем безопасный извлекатель
+    out_text = ""
     try:
-        message = update.get("message") or update.get("edited_message")
-        if not message:
-            return
+        for item in data.get("output", []):
+            for c in item.get("content", []):
+                if c.get("type") in ("output_text", "text"):
+                    out_text += c.get("text", "")
+    except:
+        pass
 
-        chat_id = message["chat"]["id"]
-        text = message.get("text", "")
-        if not text:
-            return
+    out_text = normalize_text(out_text)
+    if not out_text:
+        out_text = "Принял. Напиши, пожалуйста: возраст, страна где сейчас, гражданство."
 
-        handle_message(chat_id, text)
+    return out_text
 
-    except Exception:
-        # не падаем
-        return
 
-@app.route("/", methods=["GET"])
+# -------------------------
+# Routes
+# -------------------------
+@app.get("/")
 def health():
     return "OK", 200
 
-@app.route("/", methods=["POST"])
-def webhook():
-    update = request.get_json(silent=True) or {}
-    upd_id = update.get("update_id")
 
-    # DEDUPE: Telegram может прислать один апдейт несколько раз
-    if upd_id is not None:
-        with processed_lock:
-            if upd_id in processed_updates:
-                return "OK", 200
-            processed_updates.add(upd_id)
-            # чтобы set не рос бесконечно
-            if len(processed_updates) > 5000:
-                processed_updates.clear()
+@app.post("/")
+def telegram_webhook():
+    data = request.get_json(force=True, silent=True) or {}
 
-    # Главное: отвечаем Telegram быстро, а обработку делаем в фоне
-    threading.Thread(target=process_update, args=(update,), daemon=True).start()
-    return "OK", 200
+    if "message" not in data:
+        return "ok", 200
+
+    msg = data["message"]
+    chat_id = msg["chat"]["id"]
+    text = normalize_text(msg.get("text", ""))
+
+    # init state
+    if chat_id not in user_state:
+        user_state[chat_id] = {"age": None, "country": None, "citizenship": None, "ready": False}
+
+    st = user_state[chat_id]
+
+    # /start
+    if text.lower().startswith("/start"):
+        st["age"], st["country"], st["citizenship"] = None, None, None
+        st["ready"] = False
+        tg_send(
+            chat_id,
+            "Привет! Я менеджер по вакансиям в Германии 🇩🇪\n"
+            "Напиши одним сообщением:\n"
+            "✅ возраст\n✅ страна где сейчас\n✅ гражданство\n"
+            "Пример: 25 Таджикистан Таджикистан",
+        )
+        return "ok", 200
+
+    # Пытаемся распарсить профиль
+    age, country, citizenship = extract_profile(text)
+    if age is not None:
+        st["age"] = age
+    if country:
+        st["country"] = country
+    if citizenship:
+        st["citizenship"] = citizenship
+
+    # Если ещё не собрали всё — просим недостающее
+    missing = []
+    if not st["age"]:
+        missing.append("возраст")
+    if not st["country"]:
+        missing.append("страна где сейчас")
+    if not st["citizenship"]:
+        missing.append("гражданство")
+
+    if missing:
+        tg_send(chat_id, "Нужно ещё: " + ", ".join(missing) + ".\nПример: 25 Таджикистан Таджикистан")
+        return "ok", 200
+
+    # Всё собрали → AI-ответ
+    reply = openai_reply(chat_id, text, st)
+    tg_send(chat_id, reply)
+    return "ok", 200
+
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))

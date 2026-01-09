@@ -40,7 +40,7 @@ def ask_openai(messages):
     r = requests.post(OPENAI_URL, headers=headers, json=payload, timeout=30)
     return r.json()["output"][0]["content"][0]["text"]
 
-@app.route("/", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
 

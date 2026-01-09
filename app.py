@@ -1,14 +1,24 @@
-from flask import Flask, request
-import requests
 import os
+import requests
+from flask import Flask, request
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+
+TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+OPENAI_URL = "https://api.openai.com/v1/responses"
 
 app = Flask(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-
-# временное хранилище состояний пользователей
+# память пользователей
 users = {}
+
+SYSTEM_PROMPT = """
+Ты менеджер проекта "Работа в Европе".
+Ты собираешь данные: возраст, страна, гражданство.
+После этого ты предлагаешь работу в Германии или Польше.
+Пиши уверенно, коротко, по делу.
+"""
 
 def send(chat_id, text):
     requests.post(f"{TG_API}/sendMessage", json={
@@ -16,36 +26,49 @@ def send(chat_id, text):
         "text": text
     })
 
+def ask_openai(messages):
+    headers = {
+        "Authorization": f"Bearer {OPENAI_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": "gpt-4.1-mini",
+        "input": messages
+    }
+
+    r = requests.post(OPENAI_URL, headers=headers, json=payload, timeout=30)
+    return r.json()["output"][0]["content"][0]["text"]
+
 @app.route("/", methods=["POST"])
-def telegram_webhook():
+def webhook():
     data = request.get_json()
 
     if "message" not in data:
-        return "ok", 200
+        return "ok"
 
-    msg = data["message"]
-    chat_id = msg["chat"]["id"]
-    text = msg.get("text", "").strip()
+    chat_id = data["message"]["chat"]["id"]
+    text = data["message"].get("text", "")
 
-    # /start
-    if text == "/start":
-        users[chat_id] = {"step": "waiting_data"}
-        send(chat_id, "Привет! 👋\nНапиши, пожалуйста:\nВозраст, страну и гражданство\n\nНапример:\n25, Tajikistan, Tajikistan")
-        return "ok", 200
+    if chat_id not in users:
+        users[chat_id] = [
+            {"role": "system", "content": SYSTEM_PROMPT}
+        ]
+        send(chat_id, "Привет! Напиши:\n1) возраст\n2) страну\n3) гражданство")
+        return "ok"
 
-    # если ждём данные
-    if chat_id in users and users[chat_id]["step"] == "waiting_data":
-        users[chat_id]["data"] = text
-        users[chat_id]["step"] = "done"
+    users[chat_id].append({"role": "user", "content": text})
 
-        send(chat_id, f"Спасибо! Я получил:\n{text}\n\nМенеджер скоро с вами свяжется.")
-        return "ok", 200
+    try:
+        reply = ask_openai(users[chat_id])
+    except:
+        send(chat_id, "Ошибка AI. Попробуй ещё раз.")
+        return "ok"
 
-    # всё остальное
-    send(chat_id, "Напиши /start чтобы начать.")
-    return "ok", 200
+    users[chat_id].append({"role": "assistant", "content": reply})
+    send(chat_id, reply)
 
+    return "ok"
 
-@app.route("/", methods=["GET"])
-def health():
-    return "OK", 200
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
